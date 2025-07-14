@@ -6,6 +6,7 @@ from PyPDF2 import PdfReader
 import json
 import re
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables
 load_dotenv()
@@ -31,8 +32,9 @@ def read_pdf(uploaded_file):
     return text
 
 def clean_text(text):
-    text = re.sub(r'\n+', ' ', text)  # Convert multiple newlines to space
-    text = re.sub(r'\s{2,}', ' ', text)  # Remove extra spaces
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    text = re.sub(r'(?<!\w)\s+|\s+(?!\w)', '', text)
     return text.strip()
 
 # === JSON Extractor ===
@@ -44,6 +46,12 @@ def extract_json_block(text):
 
 # === Streamlit UI ===
 st.set_page_config(page_title="ResumeATS Candidate Evaluator", layout="wide")
+
+# === Initialize session state ===
+if "resume_texts" not in st.session_state:
+    st.session_state.resume_texts = {}
+if "candidates_raw" not in st.session_state:
+    st.session_state.candidates_raw = []
 
 st.markdown("""
     <h1 style='text-align: center; font-size: 42px;'>🧠 ResumeATS Candidate Evaluator</h1>
@@ -57,12 +65,41 @@ with col1:
 with col2:
     uploaded_files = st.file_uploader("📄 Upload resumes (PDF)", type=["pdf"], accept_multiple_files=True)
 
-# Cache resume content and results
-if "resume_texts" not in st.session_state:
-    st.session_state.resume_texts = {}
-if "candidates_raw" not in st.session_state:
-    st.session_state.candidates_raw = []
+# === Prompt Generator ===
+def generate_prompt(cleaned_text, job_description):
+    return f"""
+You are ResumeScanner, an expert in evaluating resumes for job relevance using ATS principles.
 
+🎯 Task:
+Analyze the following resume against the provided Job Description and return a JSON object ONLY in the exact format below:
+
+{{
+  "name": "Candidate's full name from the resume",
+  "ats_score": Score out of 100 (integer only),
+  "keywords_matched": [
+    "✅ Keyword 1",
+    "✅ Keyword 2",
+    "... (list ALL keywords/skills from JD that are found in the resume)"
+  ],
+  "q&a": [
+    "Q: A deep, resume-specific question about a technology the candidate has used (e.g., Laravel, Node.js, APIs, databases)",
+    "Q: Ask the candidate to explain a project they’ve mentioned — including goals, their role, and challenges",
+    "Q: Ask why they chose a specific technology (e.g., MySQL vs MongoDB, PHP vs Node.js) in a past project",
+    "Q: Ask about how they ensured performance, security, or scalability in a past solution",
+    "Q: Ask about teamwork, leadership, or decision-making in a real technical context"
+  ]
+}}
+
+📋 Job Description:
+{job_description.strip()}
+
+📄 Resume:
+{cleaned_text}
+
+Return only the JSON object. Do not include explanations or commentary.
+"""
+
+# === Analyze Resumes ===
 if st.button("🔍 Analyze Resumes"):
     if not uploaded_files:
         st.error("Please upload at least one resume.")
@@ -71,58 +108,39 @@ if st.button("🔍 Analyze Resumes"):
     else:
         st.session_state.resume_texts = {}
         st.session_state.candidates_raw = []
-        st.info("⏳ Processing resumes this may take a while....")
+        st.info("⏳ Processing resumes in parallel...")
 
-        for file in uploaded_files:
-            file.seek(0)
+        def process_resume(file):
             filename = file.name
+            file.seek(0)
             raw_text = read_pdf(file)
             cleaned_text = clean_text(raw_text)
-
-            st.session_state.resume_texts[filename] = cleaned_text
-
-            eval_prompt = f"""
-You are ResumeScanner, an expert in evaluating resumes for job relevance using ATS principles.
-
-🎯 Task:
-Analyze the following resume against the provided Job Description and return a JSON object ONLY in the exact format below:
-
-{{
-  "name": "Candidate's full name from the resume",
-  "ats_score": Score out of 100 (integer only),
-  "keywords_matched": [
-    "✅ Keyword 1",
-    "✅ Keyword 2",
-    "... (list ALL keywords/skills from JD that are found in the resume)"
-  ],
-  "q&a": [
-    "Q: A deep, resume-specific question about a technology the candidate has used (e.g., Laravel, Node.js, APIs, databases)",
-    "Q: Ask the candidate to explain a project they’ve mentioned — including goals, their role, and challenges",
-    "Q: Ask why they chose a specific technology (e.g., MySQL vs MongoDB, PHP vs Node.js) in a past project",
-    "Q: Ask about how they ensured performance, security, or scalability in a past solution",
-    "Q: Ask about teamwork, leadership, or decision-making in a real technical context"
-  ]
-}}
-
-📋 Job Description:
-{job_description.strip()}
-
-📄 Resume:
-{cleaned_text}
-
-Return only the JSON object. Do not include explanations or commentary.
-"""
-
+            prompt = generate_prompt(cleaned_text, job_description)
             try:
-                response = get_openai_output(eval_prompt)
+                response = get_openai_output(prompt)
                 json_data = extract_json_block(response)
                 candidate_info = json.loads(json_data)
                 candidate_info["pdf_filename"] = filename
-                st.session_state.candidates_raw.append(candidate_info)
+                return {
+                    "filename": filename,
+                    "cleaned_text": cleaned_text,
+                    "candidate_info": candidate_info
+                }
             except Exception as e:
-                st.error(f"❌ Error for {filename}: {e}")
-                st.code(response)
+                return {"error": str(e), "filename": filename, "raw_response": response}
 
+        with ThreadPoolExecutor() as executor:
+            results = list(executor.map(process_resume, uploaded_files))
+
+        for result in results:
+            if "error" in result:
+                st.error(f"❌ Error for {result['filename']}: {result['error']}")
+                st.code(result.get("raw_response", "No response"))
+            else:
+                st.session_state.resume_texts[result["filename"]] = result["cleaned_text"]
+                st.session_state.candidates_raw.append(result["candidate_info"])
+
+# === Re-evaluate Button ===
 if st.button("♻️ Re-evaluate with Updated JD"):
     if not st.session_state.resume_texts:
         st.warning("No resumes to re-evaluate. Please run analysis first.")
@@ -130,49 +148,35 @@ if st.button("♻️ Re-evaluate with Updated JD"):
         st.warning("Please enter the updated Job Description.")
     else:
         st.session_state.candidates_raw = []
-        for filename, cleaned_text in st.session_state.resume_texts.items():
-            eval_prompt = f"""
-You are ResumeScanner, an expert in evaluating resumes for job relevance using ATS principles.
 
-🎯 Task:
-Analyze the following resume against the provided Job Description and return a JSON object ONLY in the exact format below:
-
-{{
-  "name": "Candidate's full name from the resume",
-  "ats_score": Score out of 100 (integer only),
-  "keywords_matched": [
-    "✅ Keyword 1",
-    "✅ Keyword 2",
-    "... (list ALL keywords/skills from JD that are found in the resume)"
-  ],
-  "q&a": [
-    "Q: A deep, resume-specific question about a technology the candidate has used (e.g., Laravel, Node.js, APIs, databases)",
-    "Q: Ask the candidate to explain a project they’ve mentioned — including goals, their role, and challenges",
-    "Q: Ask why they chose a specific technology (e.g., MySQL vs MongoDB, PHP vs Node.js) in a past project",
-    "Q: Ask about how they ensured performance, security, or scalability in a past solution",
-    "Q: Ask about teamwork, leadership, or decision-making in a real technical context"
-  ]
-}}
-
-📋 Job Description:
-{job_description.strip()}
-
-📄 Resume:
-{cleaned_text}
-
-Return only the JSON object. Do not include explanations or commentary.
-"""
-
+        def reprocess(pair):
+            filename, cleaned_text = pair
+            prompt = generate_prompt(cleaned_text, job_description)
             try:
-                response = get_openai_output(eval_prompt)
+                response = get_openai_output(prompt)
                 json_data = extract_json_block(response)
                 candidate_info = json.loads(json_data)
                 candidate_info["pdf_filename"] = filename
-                st.session_state.candidates_raw.append(candidate_info)
+                return {
+                    "filename": filename,
+                    "cleaned_text": cleaned_text,
+                    "candidate_info": candidate_info
+                }
             except Exception as e:
-                st.error(f"❌ Error for {filename}: {e}")
-                st.code(response)
+                return {"error": str(e), "filename": filename, "raw_response": response}
 
+        with ThreadPoolExecutor() as executor:
+            results = list(executor.map(reprocess, st.session_state.resume_texts.items()))
+
+        for result in results:
+            if "error" in result:
+                st.error(f"❌ Error for {result['filename']}: {result['error']}")
+                st.code(result.get("raw_response", "No response"))
+            else:
+                st.session_state.resume_texts[result["filename"]] = result["cleaned_text"]
+                st.session_state.candidates_raw.append(result["candidate_info"])
+
+# === Display Results ===
 if st.session_state.candidates_raw:
     candidates = st.session_state.candidates_raw
     st.success("✅ Candidate evaluation complete!")
