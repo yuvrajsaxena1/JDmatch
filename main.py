@@ -6,7 +6,8 @@ from PyPDF2 import PdfReader
 import json
 import re
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor
+from typing import Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load environment variables
 load_dotenv()
@@ -32,9 +33,9 @@ def read_pdf(uploaded_file):
     return text
 
 def clean_text(text):
-    text = re.sub(r'\n+', ' ', text)
-    text = re.sub(r'\s{2,}', ' ', text)
-    text = re.sub(r'(?<!\w)\s+|\s+(?!\w)', '', text)
+    text = re.sub(r'\n+', ' ', text)  # Convert multiple newlines to space
+    text = re.sub(r'\s{2,}', ' ', text)  # Remove extra spaces
+    text = re.sub(r'(?<!\w)\s+|\s+(?!\w)', '', text)  # Remove isolated spaces
     return text.strip()
 
 # === JSON Extractor ===
@@ -44,29 +45,8 @@ def extract_json_block(text):
         return match.group(0)
     return None
 
-# === Streamlit UI ===
-st.set_page_config(page_title="ResumeATS Candidate Evaluator", layout="wide")
-
-# === Initialize session state ===
-if "resume_texts" not in st.session_state:
-    st.session_state.resume_texts = {}
-if "candidates_raw" not in st.session_state:
-    st.session_state.candidates_raw = []
-
-st.markdown("""
-    <h1 style='text-align: center; font-size: 42px;'>🧠 ResumeATS Candidate Evaluator</h1>
-    <p style='text-align: center; font-size: 18px;'>Upload resumes, paste JD, and get smart candidate cards</p>
-""", unsafe_allow_html=True)
-
-# === JD and Upload side-by-side ===
-col1, col2 = st.columns(2)
-with col1:
-    job_description = st.text_area("📋 Paste the Job Description (JD)")
-with col2:
-    uploaded_files = st.file_uploader("📄 Upload resumes (PDF)", type=["pdf"], accept_multiple_files=True)
-
 # === Prompt Generator ===
-def generate_prompt(cleaned_text, job_description):
+def generate_prompt(cleaned_text: str, job_description: str) -> str:
     return f"""
 You are ResumeScanner, an expert in evaluating resumes for job relevance using ATS principles.
 
@@ -99,7 +79,40 @@ Analyze the following resume against the provided Job Description and return a J
 Return only the JSON object. Do not include explanations or commentary.
 """
 
-# === Analyze Resumes ===
+# === Resume Processing Worker ===
+def process_resume_worker(args: Tuple[str, str, str]) -> Tuple[Optional[dict], Optional[Tuple[str, Exception, str]]]:
+    filename, cleaned_text, job_description = args
+    prompt = generate_prompt(cleaned_text, job_description)
+    try:
+        response = get_openai_output(prompt)
+        json_data = extract_json_block(response)
+        candidate_info = json.loads(json_data)
+        candidate_info["pdf_filename"] = filename
+        return candidate_info, None
+    except Exception as e:
+        return None, (filename, e, locals().get('response', ''))
+
+# === Streamlit UI ===
+st.set_page_config(page_title="ResumeATS Candidate Evaluator", layout="wide")
+
+st.markdown("""
+    <h1 style='text-align: center; font-size: 42px;'>🧠 ResumeATS Candidate Evaluator</h1>
+    <p style='text-align: center; font-size: 18px;'>Upload resumes, paste JD, and get smart candidate cards</p>
+""", unsafe_allow_html=True)
+
+# === JD and Upload side-by-side ===
+col1, col2 = st.columns(2)
+with col1:
+    job_description = st.text_area("📋 Paste the Job Description (JD)")
+with col2:
+    uploaded_files = st.file_uploader("📄 Upload resumes (PDF)", type=["pdf"], accept_multiple_files=True)
+
+# Cache resume content and results
+if "resume_texts" not in st.session_state:
+    st.session_state.resume_texts = {}
+if "candidates_raw" not in st.session_state:
+    st.session_state.candidates_raw = []
+
 if st.button("🔍 Analyze Resumes"):
     if not uploaded_files:
         st.error("Please upload at least one resume.")
@@ -108,39 +121,43 @@ if st.button("🔍 Analyze Resumes"):
     else:
         st.session_state.resume_texts = {}
         st.session_state.candidates_raw = []
-        st.info("⏳ Processing resumes in parallel...")
+        st.info("⏳ Processing resumes this may take a while....")
 
-        def process_resume(file):
-            filename = file.name
+        seen_filenames = set()
+        duplicate_filenames = set()
+        unique_files = []
+        for file in uploaded_files:
+            if file.name in seen_filenames:
+                duplicate_filenames.add(file.name)
+                continue
+            seen_filenames.add(file.name)
+            unique_files.append(file)
+
+        if duplicate_filenames:
+            st.warning(f"⚠️ Duplicate resumes detected and ignored: {', '.join(duplicate_filenames)}")
+
+        # Prepare all resumes and prompts first
+        resume_data = []
+        for file in unique_files:
             file.seek(0)
+            filename = file.name
             raw_text = read_pdf(file)
             cleaned_text = clean_text(raw_text)
-            prompt = generate_prompt(cleaned_text, job_description)
-            try:
-                response = get_openai_output(prompt)
-                json_data = extract_json_block(response)
-                candidate_info = json.loads(json_data)
-                candidate_info["pdf_filename"] = filename
-                return {
-                    "filename": filename,
-                    "cleaned_text": cleaned_text,
-                    "candidate_info": candidate_info
-                }
-            except Exception as e:
-                return {"error": str(e), "filename": filename, "raw_response": response}
+            st.session_state.resume_texts[filename] = cleaned_text
+            resume_data.append((filename, cleaned_text, job_description))
 
-        with ThreadPoolExecutor() as executor:
-            results = list(executor.map(process_resume, uploaded_files))
+        st.info(f"⏳ Sending {len(resume_data)} resumes for evaluation in parallel...")
+        with ThreadPoolExecutor(max_workers=min(5, len(resume_data))) as executor:
+            futures = [executor.submit(process_resume_worker, args) for args in resume_data]
+            for future in as_completed(futures):
+                candidate_info, error = future.result()
+                if candidate_info:
+                    st.session_state.candidates_raw.append(candidate_info)
+                elif error:
+                    filename, e, response = error
+                    st.error(f"❌ Error for {filename}: {e}")
+                    st.code(response)
 
-        for result in results:
-            if "error" in result:
-                st.error(f"❌ Error for {result['filename']}: {result['error']}")
-                st.code(result.get("raw_response", "No response"))
-            else:
-                st.session_state.resume_texts[result["filename"]] = result["cleaned_text"]
-                st.session_state.candidates_raw.append(result["candidate_info"])
-
-# === Re-evaluate Button ===
 if st.button("♻️ Re-evaluate with Updated JD"):
     if not st.session_state.resume_texts:
         st.warning("No resumes to re-evaluate. Please run analysis first.")
@@ -148,35 +165,19 @@ if st.button("♻️ Re-evaluate with Updated JD"):
         st.warning("Please enter the updated Job Description.")
     else:
         st.session_state.candidates_raw = []
+        resume_data = [(filename, cleaned_text, job_description) for filename, cleaned_text in st.session_state.resume_texts.items()]
+        st.info(f"⏳ Re-evaluating {len(resume_data)} resumes in parallel...")
+        with ThreadPoolExecutor(max_workers=min(5, len(resume_data))) as executor:
+            futures = [executor.submit(process_resume_worker, args) for args in resume_data]
+            for future in as_completed(futures):
+                candidate_info, error = future.result()
+                if candidate_info:
+                    st.session_state.candidates_raw.append(candidate_info)
+                elif error:
+                    filename, e, response = error
+                    st.error(f"❌ Error for {filename}: {e}")
+                    st.code(response)
 
-        def reprocess(pair):
-            filename, cleaned_text = pair
-            prompt = generate_prompt(cleaned_text, job_description)
-            try:
-                response = get_openai_output(prompt)
-                json_data = extract_json_block(response)
-                candidate_info = json.loads(json_data)
-                candidate_info["pdf_filename"] = filename
-                return {
-                    "filename": filename,
-                    "cleaned_text": cleaned_text,
-                    "candidate_info": candidate_info
-                }
-            except Exception as e:
-                return {"error": str(e), "filename": filename, "raw_response": response}
-
-        with ThreadPoolExecutor() as executor:
-            results = list(executor.map(reprocess, st.session_state.resume_texts.items()))
-
-        for result in results:
-            if "error" in result:
-                st.error(f"❌ Error for {result['filename']}: {result['error']}")
-                st.code(result.get("raw_response", "No response"))
-            else:
-                st.session_state.resume_texts[result["filename"]] = result["cleaned_text"]
-                st.session_state.candidates_raw.append(result["candidate_info"])
-
-# === Display Results ===
 if st.session_state.candidates_raw:
     candidates = st.session_state.candidates_raw
     st.success("✅ Candidate evaluation complete!")
